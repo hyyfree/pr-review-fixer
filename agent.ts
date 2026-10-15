@@ -33,7 +33,6 @@ type AgentContext = {
 export type PrRef = { owner: string; repo: string; number: number };
 
 const PREFERRED_MODEL = "kimi-k2.5";
-const FALLBACK_MODEL = "openai/gpt-5.4-nano";
 /** Diffs beyond this are truncated: reviews stay focused and costs bounded. */
 const MAX_DIFF_CHARS = 120_000;
 
@@ -239,11 +238,13 @@ export function buildReviewPrompt(
 }
 
 export default async function agent({ request, model, respond }: AgentContext) {
+    // Read the PR URL from a clone: respond() re-reads the original request
+    // body, and in the worker runtime the two share the underlying stream.
     let text = "";
     try {
-        text = inputTextOf(await request.json());
+        text = inputTextOf(await request.clone().json());
     } catch {
-        /* empty body handled below */
+        /* body unreadable; handled below */
     }
 
     const ref = parsePrRef(text);
@@ -267,33 +268,21 @@ export default async function agent({ request, model, respond }: AgentContext) {
             headRef,
             `fix: top review finding in PR #${ref.number}`,
         );
-        const prompt = buildReviewPrompt(ref, diff, headRef, commands);
-
-        let response: Response;
-        try {
-            response = await respond({
-                model: model(PREFERRED_MODEL),
-                instructions: SYSTEM,
-                prompt,
-            });
-        } catch {
-            // Preferred model unavailable or omitted usage: retry the fallback.
-            response = await respond({
-                model: model(FALLBACK_MODEL),
-                instructions: SYSTEM,
-                prompt,
-            });
-        }
-        if (!response.ok) {
-            response = await respond({
-                model: model(FALLBACK_MODEL),
-                instructions: SYSTEM,
-                prompt,
-            });
-        }
-        // Return the gateway's response verbatim: it carries the valid,
-        // billed usage. The review, patch and commands are the model's answer.
-        return response;
+        // The diff, head branch and exact commands ride in `instructions`
+        // (the system turn); the caller's request stays the user turn.
+        const instructions = `${SYSTEM}\n\n${buildReviewPrompt(
+            ref,
+            diff,
+            headRef,
+            commands,
+        )}`;
+        // respond() replays the caller's request through the model and owns
+        // billing/usage; return its response verbatim. No model fallback:
+        // respond() consumes the request body, so it can run only once.
+        return await respond({
+            model: model(PREFERRED_MODEL),
+            instructions,
+        });
     } catch (error) {
         return Response.json(
             {
