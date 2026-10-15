@@ -162,19 +162,68 @@ export function capDiff(diff: string): { text: string; truncated: boolean } {
 }
 
 /**
- * Fetch PR metadata and the full unified diff. The diff is capped; the
- * truncation is reported so the model can flag blind spots honestly.
+ * Extract the head branch name from a PR page's embedded JSON. Fallback for
+ * when the REST API is rate-limited. Exported for tests.
+ */
+export function parseHeadRef(html: string): string | null {
+    const match = html.match(/"headRefName":"([^"]+)"/);
+    return match ? match[1] : null;
+}
+
+/**
+ * Fetch PR metadata and the full unified diff. The diff comes from
+ * github.com's pull/N.diff endpoint (served outside the API rate limit);
+ * metadata prefers the REST API and degrades to the PR page's embedded
+ * headRefName when the API throttles shared hosting IPs. The diff is capped;
+ * the truncation is reported so the model can flag blind spots honestly.
  */
 export async function fetchPullRequest(ref: PrRef) {
-    const base = `/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`;
-    const [metaResponse, diffResponse] = await Promise.all([
-        github(base, "application/vnd.github+json"),
-        github(base, "application/vnd.github.v3.diff"),
-    ]);
-    const meta = (await metaResponse.json()) as Record<string, unknown> & {
-        head?: { ref?: string; sha?: string };
-    };
+    const diffResponse = await fetch(
+        `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}.diff`,
+        {
+            headers: { "User-Agent": "pollinations-pr-review-fixer" },
+        },
+    );
+    if (!diffResponse.ok) {
+        throw new Error(
+            `GitHub diff for PR #${ref.number} failed: ${diffResponse.status}`,
+        );
+    }
     const fullDiff = await diffResponse.text();
+
+    let meta: {
+        html_url?: string;
+        title?: string;
+        state?: string;
+        draft?: boolean;
+        user?: { login?: string };
+        head?: { ref?: string; sha?: string };
+    } = {};
+    try {
+        const apiResponse = await github(
+            `/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`,
+            "application/vnd.github+json",
+        );
+        meta = (await apiResponse.json()) as typeof meta;
+    } catch {
+        // API throttled: recover title and head branch from the PR page.
+        try {
+            const page = await fetch(
+                `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
+                { headers: { "User-Agent": "pollinations-pr-review-fixer" } },
+            );
+            if (page.ok) {
+                const html = await page.text();
+                const headRef = parseHeadRef(html);
+                meta = {
+                    html_url: `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
+                    head: headRef ? { ref: headRef } : undefined,
+                };
+            }
+        } catch {
+            /* head ref stays unresolved; commands note it below */
+        }
+    }
     return { meta, diff: capDiff(fullDiff) };
 }
 
@@ -308,8 +357,10 @@ export default async function agent({ request, model, respond }: AgentContext) {
             diff.text,
             diff.truncated,
         );
-        const head = (meta as { head?: { ref?: string; sha?: string } }).head;
-        const headRef = head?.ref ?? "main";
+        const head = meta.head;
+        // Unknown head refs use a placeholder the operator must replace:
+        // never guess the base branch, that would push to the wrong ref.
+        const headRef = head?.ref ?? "PR_HEAD_BRANCH";
         const fixMessage = report?.fix?.finding
             ? `fix: ${report.fix.finding}`
             : `fix: review finding in #${ref.number}`;
@@ -317,13 +368,15 @@ export default async function agent({ request, model, respond }: AgentContext) {
             ok: true,
             model: modelUsed,
             pr: {
-                url: (meta as { html_url?: string }).html_url,
-                title: (meta as { title?: string }).title,
-                state: (meta as { state?: string }).state,
-                draft: (meta as { draft?: boolean }).draft,
+                url:
+                    meta.html_url ??
+                    `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
+                title: meta.title,
+                state: meta.state,
+                draft: meta.draft,
                 headRef,
                 headSha: head?.sha,
-                author: (meta as { user?: { login?: string } }).user?.login,
+                author: meta.user?.login,
             },
             review: report
                 ? {
