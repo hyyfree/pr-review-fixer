@@ -3,19 +3,21 @@
  * commit that fixes its most important finding.
  *
  * Input:  the PR URL (or `owner/repo#N`) anywhere in the request text.
- * Output: JSON with review findings, a unified-diff fix patch against the PR
- *         head, and the exact non-force push commands for the operator.
+ * Output: a Responses object whose text answer is a JSON block with review
+ *         findings, a unified-diff fix patch, the exact non-force push
+ *         commands, and the automation boundaries.
  *
  * Design notes:
  * - GitHub's REST API is called unauthenticated: public PRs need no token, so
  *   the agent never holds a secret it could leak or misuse.
- * - The review is one `respond()` call on the requested model (kimi-k2.5,
- *   gpt-5.4-nano as fallback) with the full unified diff; the model answers
- *   as a fenced JSON block, parsed leniently from the Responses payload.
- * - The platform cannot push: a code agent has no credentials by design. The
- *   agent emits `fix.patch` plus the exact `git` commands; the operator runs
- *   them with their own credentials. The commands never merge, never
- *   force-push, and only ever write to the reviewed PR's head branch.
+ * - The review itself runs through respond(): the gateway owns the model
+ *   loop, billing and usage. The agent returns that response directly, so the
+ *   billed usage is always valid.
+ * - The agent is deterministic about the risky part: it fetches the PR,
+ *   resolves the head branch, and generates the exact git commands (clone →
+ *   fetch PR head → apply → commit → push WITHOUT force, only the reviewed
+ *   PR's head branch). Those commands are injected into the prompt verbatim
+ *   so the model echoes them unchanged — the model never invents push flags.
  */
 
 type AgentContext = {
@@ -30,24 +32,10 @@ type AgentContext = {
 
 export type PrRef = { owner: string; repo: string; number: number };
 
-export type ReviewFinding = {
-    severity: "critical" | "major" | "minor";
-    file: string;
-    title: string;
-    detail: string;
-};
-
-export type ReviewReport = {
-    summary: string;
-    findings: ReviewFinding[];
-    fix: { finding: string; patch: string; verify: string };
-};
-
 const PREFERRED_MODEL = "kimi-k2.5";
 const FALLBACK_MODEL = "openai/gpt-5.4-nano";
 /** Diffs beyond this are truncated: reviews stay focused and costs bounded. */
 const MAX_DIFF_CHARS = 120_000;
-const GITHUB_API = "https://api.github.com";
 
 /**
  * Pull the PR reference out of the request text. Accepts a full
@@ -95,67 +83,6 @@ function partsText(value: unknown): string {
     return "";
 }
 
-/**
- * Tolerant extraction of the model's JSON answer: fenced block first, then
- * the first balanced `{...}` span. Returns null when nothing parses.
- * Exported for tests.
- */
-export function extractReport(text: string): ReviewReport | null {
-    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    const candidates = fenced ? [fenced[1], text] : [text];
-    for (const candidate of candidates) {
-        const start = candidate.indexOf("{");
-        if (start < 0) continue;
-        let depth = 0;
-        let inString = false;
-        let escaped = false;
-        for (let i = start; i < candidate.length; i++) {
-            const ch = candidate[i];
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (ch === "\\") {
-                escaped = true;
-                continue;
-            }
-            if (ch === '"') inString = !inString;
-            if (inString) continue;
-            if (ch === "{") depth++;
-            if (ch === "}") depth--;
-            if (depth === 0) {
-                try {
-                    const parsed = JSON.parse(candidate.slice(start, i + 1));
-                    if (
-                        parsed &&
-                        typeof parsed.summary === "string" &&
-                        Array.isArray(parsed.findings)
-                    ) {
-                        return parsed as ReviewReport;
-                    }
-                } catch {
-                    /* keep scanning */
-                }
-                break;
-            }
-        }
-    }
-    return null;
-}
-
-async function github(path: string, accept: string): Promise<Response> {
-    const response = await fetch(`${GITHUB_API}${path}`, {
-        headers: {
-            Accept: accept,
-            "User-Agent": "pollinations-pr-review-fixer",
-        },
-    });
-    if (!response.ok) {
-        throw new Error(`GitHub ${path} failed: ${response.status}`);
-    }
-    return response;
-}
-
 export function capDiff(diff: string): { text: string; truncated: boolean } {
     if (diff.length <= MAX_DIFF_CHARS) return { text: diff, truncated: false };
     return { text: diff.slice(0, MAX_DIFF_CHARS), truncated: true };
@@ -168,63 +95,6 @@ export function capDiff(diff: string): { text: string; truncated: boolean } {
 export function parseHeadRef(html: string): string | null {
     const match = html.match(/"headRefName":"([^"]+)"/);
     return match ? match[1] : null;
-}
-
-/**
- * Fetch PR metadata and the full unified diff. The diff comes from
- * github.com's pull/N.diff endpoint (served outside the API rate limit);
- * metadata prefers the REST API and degrades to the PR page's embedded
- * headRefName when the API throttles shared hosting IPs. The diff is capped;
- * the truncation is reported so the model can flag blind spots honestly.
- */
-export async function fetchPullRequest(ref: PrRef) {
-    const diffResponse = await fetch(
-        `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}.diff`,
-        {
-            headers: { "User-Agent": "pollinations-pr-review-fixer" },
-        },
-    );
-    if (!diffResponse.ok) {
-        throw new Error(
-            `GitHub diff for PR #${ref.number} failed: ${diffResponse.status}`,
-        );
-    }
-    const fullDiff = await diffResponse.text();
-
-    let meta: {
-        html_url?: string;
-        title?: string;
-        state?: string;
-        draft?: boolean;
-        user?: { login?: string };
-        head?: { ref?: string; sha?: string };
-    } = {};
-    try {
-        const apiResponse = await github(
-            `/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`,
-            "application/vnd.github+json",
-        );
-        meta = (await apiResponse.json()) as typeof meta;
-    } catch {
-        // API throttled: recover title and head branch from the PR page.
-        try {
-            const page = await fetch(
-                `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
-                { headers: { "User-Agent": "pollinations-pr-review-fixer" } },
-            );
-            if (page.ok) {
-                const html = await page.text();
-                const headRef = parseHeadRef(html);
-                meta = {
-                    html_url: `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
-                    head: headRef ? { ref: headRef } : undefined,
-                };
-            }
-        } catch {
-            /* head ref stays unresolved; commands note it below */
-        }
-    }
-    return { meta, diff: capDiff(fullDiff) };
 }
 
 /**
@@ -247,88 +117,126 @@ export function fixCommands(
     ];
 }
 
-const SYSTEM = `You are a meticulous pull-request reviewer. Review the given unified diff of a GitHub pull request.
+/** What this agent deliberately refuses to do. Returned in every answer. */
+export const BOUNDARIES = [
+    "Never merges a PR: merging stays a human or maintainer action.",
+    "Never force-pushes; the push writes only to the reviewed PR's head branch, as a fast-forward.",
+    "Holds no GitHub credentials; the operator runs the push commands with their own credentials.",
+    "Never writes outside the reviewed PR branch.",
+];
 
-Rules:
-- Look for real defects only: bugs, security holes, correctness regressions, broken contracts. Style opinions are not findings.
-- Report findings ordered by severity (critical, major, minor), each with file, title and a concrete detail.
-- Then fix exactly ONE finding — the most important fixable one — with a minimal unified diff that applies cleanly with \`git apply\` against the PR head shown in the diff. Keep hunk headers accurate; do not touch unrelated lines.
-- The patch must not add dependencies, secrets, network calls to new hosts, or merge/force-push behaviour.
-- Answer with ONE fenced json block and nothing else, shaped exactly as:
-{"summary":"string","findings":[{"severity":"critical|major|minor","file":"path","title":"string","detail":"string"}],"fix":{"finding":"title of the finding being fixed","patch":"unified diff text","verify":"shell command that proves the fix, e.g. a focused test"}}`;
-
-/**
- * Pull the assistant's text out of a Responses (or Chat Completions) JSON
- * payload leniently. Exported for tests.
- */
-export function outputTextOf(payload: unknown): string {
-    if (!payload || typeof payload !== "object") return "";
-    const record = payload as { output?: unknown; choices?: unknown };
-    if (Array.isArray(record.output)) {
-        return record.output
-            .map((item) => {
-                const content = (item as { content?: unknown })?.content;
-                return Array.isArray(content)
-                    ? content
-                          .map(
-                              (part) =>
-                                  (part as { text?: unknown })?.text ?? "",
-                          )
-                          .join("")
-                    : "";
-            })
-            .join("");
-    }
-    if (Array.isArray(record.choices)) {
-        return record.choices
-            .map(
-                (choice) =>
-                    (choice as { message?: { content?: unknown } })?.message
-                        ?.content ?? "",
-            )
-            .join("");
-    }
-    return "";
-}
-
-/** One review call; falls back to the cheap model when the preferred one fails. */
-export async function review(
-    respond: AgentContext["respond"],
-    model: (id: string) => unknown,
-    diff: string,
-    truncated: boolean,
-): Promise<{ report: ReviewReport | null; modelUsed: string; raw: string }> {
-    const prompt = `${truncated ? "NOTE: the diff was truncated before review.\n" : ""}Review this pull request diff:\n\n${diff}`;
-    let modelUsed = PREFERRED_MODEL;
-    let response = await respond({
-        model: model(PREFERRED_MODEL),
-        instructions: SYSTEM,
-        prompt,
+async function githubJson(path: string): Promise<Response> {
+    const response = await fetch(`https://api.github.com${path}`, {
+        headers: {
+            Accept: "application/vnd.github+json",
+            "User-Agent": "pollinations-pr-review-fixer",
+        },
     });
     if (!response.ok) {
-        modelUsed = FALLBACK_MODEL;
-        response = await respond({
-            model: model(FALLBACK_MODEL),
-            instructions: SYSTEM,
-            prompt,
-        });
+        throw new Error(`GitHub ${path} failed: ${response.status}`);
     }
-    let raw = "";
-    try {
-        raw = outputTextOf(await response.json());
-    } catch {
-        /* report stays null below */
-    }
-    return { report: extractReport(raw), modelUsed, raw };
+    return response;
 }
 
-/** What this agent deliberately refuses to do, returned with every answer. */
-export const AUTOMATION_BOUNDARIES = [
-    "Never merges a PR: merging stays a human or maintainer action.",
-    "Never force-pushes; the emitted push command is a fast-forward write to the reviewed PR's head branch only.",
-    "Holds no GitHub credentials: GitHub is read unauthenticated and the operator runs the push commands with their own credentials.",
-    "Never writes outside the reviewed PR branch, and never edits review comments or other issues.",
-];
+type PrMeta = {
+    html_url?: string;
+    title?: string;
+    state?: string;
+    draft?: boolean;
+    user?: { login?: string };
+    head?: { ref?: string; sha?: string };
+};
+
+/**
+ * Fetch PR metadata and the full unified diff. The diff comes from
+ * github.com's pull/N.diff endpoint (served outside the API rate limit);
+ * metadata prefers the REST API and degrades to the PR page's embedded
+ * headRefName when the API throttles shared hosting IPs.
+ */
+export async function fetchPullRequest(ref: PrRef): Promise<{
+    meta: PrMeta;
+    diff: { text: string; truncated: boolean };
+}> {
+    const diffResponse = await fetch(
+        `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}.diff`,
+        { headers: { "User-Agent": "pollinations-pr-review-fixer" } },
+    );
+    if (!diffResponse.ok) {
+        throw new Error(
+            `GitHub diff for PR #${ref.number} failed: ${diffResponse.status}`,
+        );
+    }
+    const fullDiff = await diffResponse.text();
+
+    let meta: PrMeta = {};
+    try {
+        meta = (await (
+            await githubJson(
+                `/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`,
+            )
+        ).json()) as PrMeta;
+    } catch {
+        // API throttled: recover the head branch from the PR page.
+        try {
+            const page = await fetch(
+                `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
+                { headers: { "User-Agent": "pollinations-pr-review-fixer" } },
+            );
+            if (page.ok) {
+                const html = await page.text();
+                const headRef = parseHeadRef(html);
+                meta = {
+                    html_url: `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
+                    head: headRef ? { ref: headRef } : undefined,
+                };
+            }
+        } catch {
+            /* head ref stays unresolved; commands use a placeholder below */
+        }
+    }
+    return { meta, diff: capDiff(fullDiff) };
+}
+
+const SYSTEM = `You are a meticulous pull-request reviewer. You are given a GitHub pull request diff and, from the operator, the exact git commands that will deliver the fix. Review the diff and answer with ONE fenced json block and nothing else.
+
+Rules:
+- Findings: real defects only — bugs, security holes, correctness regressions, broken contracts. No style opinions. Order by severity (critical, major, minor); each has severity, file, title, detail.
+- Fix: exactly ONE finding — the most important fixable one — with a minimal unified diff that applies cleanly with \`git apply\` against the PR head. Accurate hunk headers; do not touch unrelated lines; add no dependencies, secrets, or merge/force-push behaviour. Include a \`verify\` command that proves the fix (e.g. a focused test).
+- Echo the operator-provided \`commands\` array and \`boundaries\` array VERBATIM. Never invent, reorder, or add git commands, and never add --force.
+
+Output shape, exactly:
+{"summary":"string","findings":[{"severity":"critical|major|minor","file":"path","title":"string","detail":"string"}],"fix":{"finding":"title of the finding being fixed","patch":"unified diff text","verify":"shell command"},"commands":["the verbatim operator commands"],"boundaries":["the verbatim boundaries"]}`;
+
+/**
+ * Build the review prompt. Injects the diff, the PR head branch and the
+ * exact deterministic commands so the model echoes them unchanged.
+ * Exported for tests.
+ */
+export function buildReviewPrompt(
+    ref: PrRef,
+    diff: { text: string; truncated: boolean },
+    headRef: string,
+    commands: string[],
+): string {
+    return [
+        `Review this GitHub pull request: https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
+        `PR head branch: ${headRef}`,
+        diff.truncated
+            ? "NOTE: the diff was truncated; review what is present and flag the truncation in the summary."
+            : "",
+        "",
+        'OPERATOR-COMMANDS (echo this exact array as "commands"):',
+        JSON.stringify(commands, null, 2),
+        "",
+        'BOUNDARIES (echo this exact array as "boundaries"):',
+        JSON.stringify(BOUNDARIES, null, 2),
+        "",
+        "UNIFIED DIFF:",
+        diff.text,
+    ]
+        .filter((line) => line !== "")
+        .join("\n");
+}
 
 export default async function agent({ request, model, respond }: AgentContext) {
     let text = "";
@@ -351,49 +259,41 @@ export default async function agent({ request, model, respond }: AgentContext) {
 
     try {
         const { meta, diff } = await fetchPullRequest(ref);
-        const { report, modelUsed } = await review(
-            respond,
-            model,
-            diff.text,
-            diff.truncated,
+        // Never guess the base branch when the head ref is unknown — a wrong
+        // push target is the one destructive outcome this agent must avoid.
+        const headRef = meta.head?.ref ?? "PR_HEAD_BRANCH";
+        const commands = fixCommands(
+            ref,
+            headRef,
+            `fix: top review finding in PR #${ref.number}`,
         );
-        const head = meta.head;
-        // Unknown head refs use a placeholder the operator must replace:
-        // never guess the base branch, that would push to the wrong ref.
-        const headRef = head?.ref ?? "PR_HEAD_BRANCH";
-        const fixMessage = report?.fix?.finding
-            ? `fix: ${report.fix.finding}`
-            : `fix: review finding in #${ref.number}`;
-        return Response.json({
-            ok: true,
-            model: modelUsed,
-            pr: {
-                url:
-                    meta.html_url ??
-                    `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}`,
-                title: meta.title,
-                state: meta.state,
-                draft: meta.draft,
-                headRef,
-                headSha: head?.sha,
-                author: meta.user?.login,
-            },
-            review: report
-                ? {
-                      summary: report.summary,
-                      findings: report.findings,
-                      fix: {
-                          finding: report.fix.finding,
-                          verify: report.fix.verify,
-                          patchFile: "fix.patch",
-                          patch: report.fix.patch,
-                          commands: fixCommands(ref, headRef, fixMessage),
-                      },
-                  }
-                : null,
-            diffTruncated: diff.truncated,
-            boundaries: AUTOMATION_BOUNDARIES,
-        });
+        const prompt = buildReviewPrompt(ref, diff, headRef, commands);
+
+        let response: Response;
+        try {
+            response = await respond({
+                model: model(PREFERRED_MODEL),
+                instructions: SYSTEM,
+                prompt,
+            });
+        } catch {
+            // Preferred model unavailable or omitted usage: retry the fallback.
+            response = await respond({
+                model: model(FALLBACK_MODEL),
+                instructions: SYSTEM,
+                prompt,
+            });
+        }
+        if (!response.ok) {
+            response = await respond({
+                model: model(FALLBACK_MODEL),
+                instructions: SYSTEM,
+                prompt,
+            });
+        }
+        // Return the gateway's response verbatim: it carries the valid,
+        // billed usage. The review, patch and commands are the model's answer.
+        return response;
     } catch (error) {
         return Response.json(
             {
