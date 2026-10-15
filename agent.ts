@@ -32,7 +32,7 @@ type AgentContext = {
 
 export type PrRef = { owner: string; repo: string; number: number };
 
-const PREFERRED_MODEL = "kimi-k2.5";
+const PREFERRED_MODEL = "openai/gpt-5.4-nano";
 /** Diffs beyond this are truncated: reviews stay focused and costs bounded. */
 const MAX_DIFF_CHARS = 120_000;
 
